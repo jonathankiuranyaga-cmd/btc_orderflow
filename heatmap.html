@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BTC Order-Flow Heatmap (live)</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b0e14;color:#cfd6e4;font:13px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+#bar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding:8px 12px;background:#121722;border-bottom:1px solid #222a3a}
+#bar label{display:flex;gap:5px;align-items:center;color:#8b97ad}
+#bar input,#bar select{width:68px;background:#0b0e14;color:#e6ebf5;border:1px solid #2a3347;border-radius:4px;padding:3px 5px}
+.st b{color:#e6ebf5;font-variant-numeric:tabular-nums}.up{color:#2ecc8f}.dn{color:#ff5c6c}
+#dot{width:9px;height:9px;border-radius:50%;background:#ff5c6c}#dot.ok{background:#2ecc8f}
+#main{flex:1;min-height:0;position:relative}#c,#d{position:absolute;left:0;width:100%}
+#c{top:0;height:75%}#d{top:75%;height:25%;border-top:1px solid #222a3a}
+#note{padding:5px 12px;font-size:11px;color:#6d7a93;background:#121722;border-top:1px solid #222a3a}
+</style></head><body>
+<div id="bar">
+ <span><span id="dot"></span> <span id="status">connecting…</span></span>
+ <span class="st">BTCUSDT perp <b id="px">-</b></span>
+ <span class="st">BTC-USD (Coinbase) <b id="cb">-</b></span>
+ <span class="st">basis <b id="basis">-</b></span>
+ <span class="st">1m buy/sell <b id="vol">-</b></span>
+ <span class="st">1m delta <b id="dlt">-</b></span>
+ <span class="st">CVD <b id="cvd">-</b></span>
+ <label>Bucket $<select id="bucket"><option>1</option><option selected>2</option><option>5</option><option>10</option></select></label>
+ <label>Range ±$<input id="range" type="number" value="150" step="25"></label>
+    <label>Bubble ≥BTC<input id="bub" type="number" value="1" step="0.5"></label>
+    <label>Absorb ≥BTC<input id="abs" type="number" value="15" step="5"></label>
+    <label><input id="follow" type="checkbox" checked> Follow price</label>
+    <label><input id="showWalls" type="checkbox" checked> Walls</label>
+    <label><input id="showAbs" type="checkbox" checked> Absorption</label>
+    <label><input id="showBub" type="checkbox" checked> Bubbles</label>
+  </div>
+<div id="main"><canvas id="c"></canvas><canvas id="d"></canvas></div>
+<div id="note">Perp futures quoted in USDT (not USD). Heat = resting limit orders (can be pulled/spoofed). Bubbles = aggressive trades: green buy, red sell. ▲/▼ = possible absorption. Dashed lines = persistent walls. Not financial advice.</div>
+<script>
+const $=id=>document.getElementById(id), H=400, MAXC=600, AXW=64;
+  let bucket=+$('bucket').value, range=+$('range').value, bubMin=+$('bub').value, absMin=+$('abs').value;
+  const bids=new Map(), asks=new Map();
+  let cols=[], trades=[], secs=[], cvd=0, last=null, cb=null, center=null;
+  let synced=false, syncing=false, buf=[], lastU=0, strict=true, sB=0, sS=0;
+  let follow=true, showWalls=true, showAbs=true, showBub=true;
+  try{
+    const s=JSON.parse(localStorage.getItem('ofh')||'{}');
+    if(s.bucket) { $('bucket').value=s.bucket; bucket=+s.bucket; }
+    if(s.range) { $('range').value=s.range; range=+s.range; }
+    if(s.bub) { $('bub').value=s.bub; bubMin=+s.bub; }
+    if(s.abs) { $('abs').value=s.abs; absMin=+s.abs; }
+    $('follow').checked=s.follow!==false; follow=$('follow').checked;
+    $('showWalls').checked=s.showWalls!==false; showWalls=$('showWalls').checked;
+    $('showAbs').checked=s.showAbs!==false; showAbs=$('showAbs').checked;
+    $('showBub').checked=s.showBub!==false; showBub=$('showBub').checked;
+  }catch(e){}
+  function save(){ try{localStorage.setItem('ofh',JSON.stringify({bucket,range,bubMin,absMin,follow,showWalls,showAbs,showBub}));}catch(e){} }
+  $('follow').onchange=e=>{follow=e.target.checked;save()};
+  $('showWalls').onchange=e=>{showWalls=e.target.checked;save()};
+  $('showAbs').onchange=e=>{showAbs=e.target.checked;save()};
+  $('showBub').onchange=e=>{showBub=e.target.checked;save()};
+
+/* ---------- order book (Binance diff-depth with REST snapshot) ---------- */
+function applyDepth(d){
+  for(const [p,q] of d.b){const k=+p,v=+q; v===0?bids.delete(k):bids.set(k,v);}
+  for(const [p,q] of d.a){const k=+p,v=+q; v===0?asks.delete(k):asks.set(k,v);}
+}
+async function resync(){
+  if(syncing) return; syncing=true; synced=false; buf=[]; bids.clear(); asks.clear();
+  try{
+    const r=await fetch('https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=1000');
+    const s=await r.json(); if(!s.bids) throw new Error('bad snapshot');
+    s.bids.forEach(([p,q])=>bids.set(+p,+q)); s.asks.forEach(([p,q])=>asks.set(+p,+q));
+    lastU=s.lastUpdateId; strict=true;
+    for(const e of buf){ if(e.u<s.lastUpdateId) continue; applyDepth(e); lastU=e.u; }
+  }catch(e){ strict=false; $('status').textContent='snapshot failed - book builds from updates only'; }
+  buf=[]; synced=true; syncing=false;
+}
+function onDepth(d){
+  if(!synced){ buf.push(d); return; }
+  if(strict && d.pu!==lastU){ resync(); buf.push(d); return; }
+  applyDepth(d); lastU=d.u;
+}
+function onTrade(d){
+  const p=+d.p,q=+d.q,sell=!!d.m; last=p; trades.push({t:d.T,p,q,sell});
+  if(sell){sS+=q;cvd-=q}else{sB+=q;cvd+=q}
+}
+
+/* ---------- feeds ---------- */
+function connect(){
+  const ws=new WebSocket('wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@depth@100ms');
+  ws.onopen=()=>{$('dot').className='ok';$('status').textContent='live';resync()};
+  ws.onmessage=m=>{const j=JSON.parse(m.data),d=j.data; d.e==='aggTrade'?onTrade(d):onDepth(d)};
+  ws.onclose=ws.onerror=()=>{$('dot').className='';$('status').textContent='reconnecting…';ws.onclose=null;setTimeout(connect,2500)};
+}
+function connectCB(){
+  const ws=new WebSocket('wss://ws-feed.exchange.coinbase.com');
+  ws.onopen=()=>ws.send(JSON.stringify({type:'subscribe',product_ids:['BTC-USD'],channels:['ticker']}));
+  ws.onmessage=m=>{const j=JSON.parse(m.data); if(j.type==='ticker') cb=+j.price};
+  ws.onclose=ws.onerror=()=>{ws.onclose=null;setTimeout(connectCB,3000)};
+}
+connect(); connectCB();
+
+/* ---------- 1s sampler: heatmap column + delta/CVD series ---------- */
+setInterval(()=>{
+  const now=Date.now();
+  secs.push({t:now,d:sB-sS,cvd}); sB=sS=0; if(secs.length>MAXC) secs.shift();
+  while(trades.length&&trades[0].t<now-15*60000) trades.shift();
+  if(!synced||!bids.size||!asks.size) return;
+  let bb=-Infinity,ba=Infinity; for(const p of bids.keys()) if(p>bb) bb=p; for(const p of asks.keys()) if(p<ba) ba=p;
+  const mid=(bb+ba)/2, a=new Float32Array(2*H+1);
+  for(const m of [bids,asks]) for(const [p,q] of m){const i=Math.round((p-mid)/bucket)+H; if(i>=0&&i<=2*H) a[i]+=q;}
+  cols.push({t:now,mid,a}); if(cols.length>MAXC) cols.shift();
+},1000);
+
+/* ---------- analytics ---------- */
+function absorption(){
+  const now=Date.now(), zw=Math.max(5,bucket*3), z=new Map(); let lo=Infinity,hi=-Infinity;
+  for(let i=trades.length-1;i>=0&&trades[i].t>now-20000;i--){
+    const t=trades[i]; lo=Math.min(lo,t.p); hi=Math.max(hi,t.p);
+    const k=Math.round(t.p/zw)*zw; let e=z.get(k); if(!e){e={s:0,b:0};z.set(k,e)} t.sell?e.s+=t.q:e.b+=t.q;
+  }
+  const out=[];
+  for(const [k,e] of z){
+    if(e.s>=absMin && lo>=k-zw && last>k) out.push({p:k,side:'bid',v:e.s});
+    if(e.b>=absMin && hi<=k+zw && last<k) out.push({p:k,side:'ask',v:e.b});
+  }
+  return out;
+}
+function walls(){
+  if(!cols.length) return [];
+  const c=cols[cols.length-1], prior=cols.slice(-10), res=[], vals=[];
+  for(let i=0;i<c.a.length;i++) if(c.a[i]>0) vals.push(c.a[i]);
+  if(!vals.length) return [];
+  const mean=vals.reduce((x,y)=>x+y,0)/vals.length, thr=Math.max(20,4*mean);
+  for(let i=0;i<c.a.length;i++){
+    if(c.a[i]<thr) continue; const p=c.mid+(i-H)*bucket;
+    if(Math.abs(p-center)>range) continue;
+    const persist=prior.filter(o=>{const j=Math.round((p-o.mid)/bucket)+H;return j>=0&&j<=2*H&&o.a[j]>=c.a[i]*0.5}).length;
+    if(persist>=6) res.push({p,q:c.a[i],side:p<(c.mid)?'bid':'ask'});
+  }
+  return res.sort((a,b)=>b.q-a.q).slice(0,6);
+}
+
+/* ---------- drawing ---------- */
+const stops=[[0,[8,12,24]],[.25,[24,40,120]],[.5,[130,40,160]],[.75,[240,160,30]],[1,[255,250,200]]];
+const lut=Array.from({length:256},(_,i)=>{const t=i/255;let k=1;while(k<stops.length-1&&t>stops[k][0])k++;
+  const [t0,a]=stops[k-1],[t1,b]=stops[k],f=(t-t0)/(t1-t0);return a.map((v,j)=>Math.round(v+(b[j]-v)*f))});
+const off=document.createElement('canvas'), cv=$('c'), dv=$('d');
+function fit(c){const r=c.getBoundingClientRect(),dp=devicePixelRatio||1;c.width=r.width*dp;c.height=r.height*dp;const x=c.getContext('2d');x.setTransform(dp,0,0,dp,0,0);return[x,r.width,r.height]}
+
+function draw(){
+  if(last===null) return;
+  if(follow) center=center===null?last:center+(last-center)*0.15;
+  else if(center===null) center=last;
+  const [ctx,Wf,Ht]=fit(cv), W=Wf-AXW, now=Date.now(), colW=W/MAXC;
+  ctx.fillStyle='#0b0e14'; ctx.fillRect(0,0,Wf,Ht);
+  const Y=p=>(center+range-p)/(2*range)*Ht, X=t=>W-(now-t)/1000*colW;
+  if(cols.length){
+    const rows=Math.round(2*range/bucket), n=cols.length; off.width=n; off.height=rows;
+    const oc=off.getContext('2d'), img=oc.createImageData(n,rows), vals=[];
+    for(const c of cols.slice(-5)) for(const v of c.a) if(v>0) vals.push(v);
+    vals.sort((a,b)=>a-b); const mx=vals.length?(vals[Math.floor(vals.length*0.99)]||1):1;
+    for(let x=0;x<n;x++){const c=cols[x];
+      for(let r=0;r<rows;r++){
+        const p=center+range-(r+0.5)*bucket, i=Math.round((p-c.mid)/bucket)+H, q=(i>=0&&i<=2*H)?c.a[i]:0;
+        const rgb=lut[Math.round(Math.min(1,Math.pow(q/mx,0.6))*255)], o=(r*n+x)*4;
+        img.data[o]=rgb[0];img.data[o+1]=rgb[1];img.data[o+2]=rgb[2];img.data[o+3]=255;
+      }}
+    oc.putImageData(img,0,0); ctx.imageSmoothingEnabled=false;
+    ctx.drawImage(off,X(cols[n-1].t)-(n-1)*colW,0,n*colW,Ht);
+  }
+  /* walls */
+  ctx.font='11px system-ui'; ctx.setLineDash([6,4]);
+  if(showWalls){
+    for(const w of walls()){
+      ctx.strokeStyle=w.side==='bid'?'#2ecc8f':'#ff5c6c'; ctx.beginPath(); ctx.moveTo(0,Y(w.p)); ctx.lineTo(W,Y(w.p)); ctx.stroke();
+      ctx.fillStyle=ctx.strokeStyle; ctx.fillText(`${w.side} wall ${w.q.toFixed(0)} BTC`,6,Y(w.p)-3);
+    }
+  }
+  ctx.setLineDash([]);
+  /* bubbles */
+  if(showBub){
+    for(const t of trades){
+      if(t.q<bubMin||t.t<now-MAXC*1000) continue;
+      const x=X(t.t), y=Y(t.p); if(y<0||y>Ht) continue;
+      const age=(now-t.t)/1000, fade=Math.max(0.25,1-age/60);
+      const r=Math.min(40,4+Math.sqrt(t.q/bubMin)*5);
+      ctx.beginPath(); ctx.arc(x,y,r,0,7);
+      ctx.fillStyle=t.sell?`rgba(255,92,108,${0.45*fade})`:`rgba(46,204,143,${0.45*fade})`; ctx.fill();
+      ctx.strokeStyle=t.sell?`rgba(255,92,108,${fade})`:`rgba(46,204,143,${fade})`; ctx.stroke();
+    }
+  }
+  /* absorption markers */
+  if(showAbs){
+    for(const a of absorption()){
+      const y=Y(a.p); ctx.fillStyle=a.side==='bid'?'#2ecc8f':'#ff5c6c'; ctx.font='bold 12px system-ui';
+      ctx.fillText((a.side==='bid'?'▲ bid absorbing ':'▼ ask absorbing ')+a.v.toFixed(1)+' BTC',W-190,y+4);
+    }
+  }
+  /* price line + axis */
+  ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(0,Y(last)); ctx.lineTo(W,Y(last)); ctx.stroke();
+  ctx.fillStyle='#0b0e14'; ctx.fillRect(W,0,AXW,Ht); ctx.fillStyle='#8b97ad'; ctx.font='11px system-ui';
+  const step=Math.max(bucket,Math.pow(10,Math.floor(Math.log10(range/2))));
+  for(let p=Math.ceil((center-range)/step)*step;p<center+range;p+=step) ctx.fillText(p.toFixed(0),W+6,Y(p)+4);
+  ctx.fillStyle='#fff'; ctx.fillRect(W,Y(last)-8,AXW,16); ctx.fillStyle='#000'; ctx.fillText(last.toFixed(1),W+4,Y(last)+4);
+  drawFlow();
+  hud(now);
+}
+function drawFlow(){
+  const [x,Wf,Ht]=fit(dv), W=Wf-AXW, colW=W/MAXC; x.fillStyle='#0b0e14'; x.fillRect(0,0,Wf,Ht);
+  if(!secs.length) return;
+  const md=Math.max(1,...secs.map(s=>Math.abs(s.d))), cs=secs.map(s=>s.cvd), lo=Math.min(...cs), hi=Math.max(...cs)||1, sp=(hi-lo)||1, off0=W-secs.length*colW;
+  secs.forEach((s,i)=>{const h=Math.abs(s.d)/md*(Ht*0.3); x.fillStyle=s.d>=0?'#2ecc8f':'#ff5c6c'; x.fillRect(off0+i*colW,Ht*0.35-(s.d>=0?h:0),Math.max(1,colW),h)});
+  x.strokeStyle='#e6ebf5'; x.beginPath(); secs.forEach((s,i)=>{const px=off0+i*colW, py=Ht-6-((s.cvd-lo)/sp)*(Ht*0.5); i?x.lineTo(px,py):x.moveTo(px,py)}); x.stroke();
+  x.fillStyle='#6d7a93'; x.font='11px system-ui'; x.fillText('delta per second (bars) · CVD (line)',6,12);
+}
+function hud(now){
+  let b=0,s=0; for(let i=trades.length-1;i>=0&&trades[i].t>now-60000;i--) trades[i].sell?s+=trades[i].q:b+=trades[i].q;
+  const d=b-s; $('px').textContent=last.toFixed(1); $('cb').textContent=cb?cb.toFixed(2):'-';
+  $('basis').textContent=cb?((last/cb-1)*1e4).toFixed(1)+' bps':'-';
+  $('vol').textContent=`${b.toFixed(1)} / ${s.toFixed(1)}`;
+  $('dlt').textContent=(d>=0?'+':'')+d.toFixed(1); $('dlt').className=d>=0?'up':'dn';
+  $('cvd').textContent=(cvd>=0?'+':'')+cvd.toFixed(1); $('cvd').className=cvd>=0?'up':'dn';
+}
+setInterval(draw,200);
+</script></body></html>
