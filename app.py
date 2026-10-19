@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import json
+import sqlite3
+from pathlib import Path
 from statistics import median
 from typing import Any
 
 import altair as alt
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from backtest import run_backtest, run_walk_forward
 from forecast import forecast_next_minute
 
@@ -17,6 +23,15 @@ PRODUCT = "BTC-USD"
 REFRESH_SECONDS = 3
 TRADE_WINDOW_SECONDS = 60
 TRADE_RETENTION_SECONDS = 900
+DB_PATH = Path(__file__).with_name("paper_trades.db")
+
+SESSION = requests.Session()
+SESSION.mount(
+    "https://",
+    HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])),
+)
+
+_forecast_cache: dict[tuple[int, int], dict[str, Any] | None] = {}
 
 st.set_page_config(page_title="BTC Order Flow | Paper Desk", page_icon="₿", layout="wide")
 st.markdown(
@@ -83,22 +98,26 @@ st.caption("Scalping dashboard · public exchange data · paper execution only")
 
 
 def request_json(url: str, params: dict[str, Any] | None = None) -> Any:
-    response = requests.get(url, params=params, timeout=8)
+    response = SESSION.get(url, params=params, timeout=8)
     response.raise_for_status()
     return response.json()
 
 
 def fetch_market_data() -> tuple[list[dict[str, Any]], dict[str, Any], float]:
-    trades = request_json(
-        f"{BINANCE_BASE}/fapi/v1/aggTrades",
-        {"symbol": SYMBOL, "limit": 1000},
-    )
-    book = request_json(
-        f"{BINANCE_BASE}/fapi/v1/depth",
-        {"symbol": SYMBOL, "limit": 1000},
-    )
-    ticker = request_json(f"{COINBASE_BASE}/products/{PRODUCT}/ticker")
-    return trades, book, float(ticker["price"])
+    endpoints = [
+        ("trades", f"{BINANCE_BASE}/fapi/v1/aggTrades", {"symbol": SYMBOL, "limit": 1000}),
+        ("book", f"{BINANCE_BASE}/fapi/v1/depth", {"symbol": SYMBOL, "limit": 1000}),
+        ("ticker", f"{COINBASE_BASE}/products/{PRODUCT}/ticker", None),
+    ]
+    results: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(request_json, url, params): name for name, url, params in endpoints
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            results[name] = future.result()
+    return results["trades"], results["book"], float(results["ticker"]["price"])
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -135,9 +154,43 @@ def fetch_backtest_klines(days: int) -> list[list[Any]]:
     return rows
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def cached_forecast(rows: tuple[tuple[Any, ...], ...]) -> dict[str, float | int | str] | None:
-    return forecast_next_minute(rows)
+def cached_forecast(
+    last_close_ms: int, rows: tuple[tuple[Any, ...], ...]
+) -> dict[str, float | int | str] | None:
+    key = (last_close_ms, len(rows))
+    if key in _forecast_cache:
+        return _forecast_cache[key]
+    result = forecast_next_minute(list(rows)) if rows else None
+    _forecast_cache[key] = result
+    return result
+
+
+def init_trade_journal() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_trade_journal(trades: list[dict[str, Any]]) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM paper_trades")
+        for trade in trades:
+            conn.execute("INSERT INTO paper_trades(entry) VALUES (?)", (json.dumps(trade, default=str),))
+        conn.commit()
+
+
+def load_trade_journal() -> list[dict[str, Any]]:
+    init_trade_journal()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT entry FROM paper_trades ORDER BY id").fetchall()
+    return [json.loads(row[0]) for row in rows]
 
 
 def initialize_state() -> None:
@@ -145,7 +198,7 @@ def initialize_state() -> None:
         "trade_buffer": [],
         "last_trade_id": None,
         "paper_position": None,
-        "paper_trades": [],
+        "paper_trades": load_trade_journal(),
         "starting_equity": 10_000.0,
         "utc_day": datetime.now(timezone.utc).date().isoformat(),
         "last_data_error": None,
@@ -198,25 +251,174 @@ def summarize_flow(trades: list[dict[str, Any]]) -> dict[str, float | int]:
     }
 
 
+def aggregate_trade_candles(
+    trades: list[dict[str, Any]], now: float, window_seconds: int, interval_seconds: int = 10
+) -> list[dict[str, Any]]:
+    candles: dict[int, dict[str, Any]] = {}
+    window_start = now - window_seconds
+    for trade in sorted(trades, key=lambda item: float(item["time"])):
+        trade_time = float(trade["time"])
+        if trade_time < window_start or trade_time > now:
+            continue
+        bucket_start = int(trade_time // interval_seconds) * interval_seconds
+        price = float(trade["price"])
+        candle = candles.get(bucket_start)
+        if candle is None:
+            candles[bucket_start] = {
+                "timestamp": bucket_start,
+                "Open": price,
+                "High": price,
+                "Low": price,
+                "Close": price,
+                "Trades": 1,
+            }
+        else:
+            candle["High"] = max(candle["High"], price)
+            candle["Low"] = min(candle["Low"], price)
+            candle["Close"] = price
+            candle["Trades"] += 1
+
+    result = []
+    for candle in candles.values():
+        candle["UTC time"] = datetime.fromtimestamp(candle.pop("timestamp"), timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        candle["Direction"] = "Up" if candle["Close"] >= candle["Open"] else "Down"
+        result.append(candle)
+    return result
+
+
+def summarize_flow_intervals(
+    trades: list[dict[str, Any]], now: float, interval_seconds: int = 10, window_seconds: int = 60
+) -> list[dict[str, Any]]:
+    interval_count = window_seconds // interval_seconds
+    buckets = [{"buy_qty": 0.0, "sell_qty": 0.0, "trade_count": 0} for _ in range(interval_count)]
+    window_start = now - window_seconds
+    for trade in trades:
+        trade_time = float(trade["time"])
+        if trade_time < window_start or trade_time > now:
+            continue
+        index = min(int((trade_time - window_start) // interval_seconds), interval_count - 1)
+        bucket = buckets[index]
+        if trade["sell_aggressor"]:
+            bucket["sell_qty"] += float(trade["quantity"])
+        else:
+            bucket["buy_qty"] += float(trade["quantity"])
+        bucket["trade_count"] += 1
+
+    intervals = []
+    for index, bucket in enumerate(buckets):
+        delta = bucket["buy_qty"] - bucket["sell_qty"]
+        intervals.append(
+            {
+                "Interval": f"{window_seconds - (index + 1) * interval_seconds}-{window_seconds - index * interval_seconds}s ago",
+                "Buyer-initiated (BTC)": bucket["buy_qty"],
+                "Seller-initiated (BTC)": bucket["sell_qty"],
+                "Net delta (BTC)": delta,
+                "Trades": bucket["trade_count"],
+            }
+        )
+    return intervals
+
+
+def describe_aggressor_strength(
+    flow: dict[str, Any], min_flow: float, min_trades: int, min_total_btc: float
+) -> str:
+    if int(flow["trade_count"]) < min_trades or float(flow["total"]) < min_total_btc:
+        return "Insufficient 60s flow"
+    delta_fraction = float(flow["delta_fraction"])
+    if delta_fraction >= min_flow:
+        return "Strong buyer aggression"
+    if delta_fraction <= -min_flow:
+        return "Strong seller aggression"
+    if delta_fraction > 0:
+        return "Buyers lead, below strong threshold"
+    if delta_fraction < 0:
+        return "Sellers lead, below strong threshold"
+    return "Balanced aggressor flow"
+
+
+def absorption_heuristic(recent: list[dict[str, Any]], flow: dict[str, Any]) -> dict[str, str] | None:
+    """Flag strong one-sided aggression that fails to move price (possible absorption)."""
+    delta_abs = abs(float(flow["delta_fraction"]))
+    if delta_abs < 0.40:
+        return None
+    prices = [t["price"] for t in recent]
+    first_price, last_price = prices[0], prices[-1]
+    move_bps = (last_price / first_price - 1) * 10_000 if first_price else 0.0
+    steps = [
+        abs(prices[i + 1] / prices[i] - 1) * 10_000
+        for i in range(len(prices) - 1)
+        if prices[i]
+    ]
+    typical_step = median(steps) if steps else 0.0
+    threshold_bps = max(3.0, typical_step * 2.0)
+    if abs(move_bps) >= threshold_bps:
+        return None
+    side = "buyer" if flow["delta"] > 0 else "seller"
+    absorbing_side = "sellers" if flow["delta"] > 0 else "buyers"
+    return {
+        "message": (
+            f"Absorption: strong {side} aggression (delta {flow['delta_fraction']:+.1%}) but price only moved "
+            f"{move_bps:+.1f} bps (typical step {typical_step:.1f} bps) — {absorbing_side} may be absorbing."
+        )
+    }
+
+
 def summarize_book(book: dict[str, Any], levels: int) -> dict[str, Any]:
-    bids = sorted(
-        ((float(price), float(qty)) for price, qty in book["bids"][:levels]),
-        reverse=True,
-    )
-    asks = sorted((float(price), float(qty)) for price, qty in book["asks"][:levels])
+    bids_raw = book.get("bids") or []
+    asks_raw = book.get("asks") or []
+    bids = sorted(((float(price), float(qty)) for price, qty in bids_raw[:levels]), reverse=True)
+    asks = sorted((float(price), float(qty)) for price, qty in asks_raw[:levels])
     bid_qty = sum(qty for _, qty in bids)
     ask_qty = sum(qty for _, qty in asks)
     total_qty = bid_qty + ask_qty
-    best_bid, best_ask = bids[0][0], asks[0][0]
+    if not bids or not asks:
+        best_bid = 0.0
+        best_ask = 0.0
+    else:
+        best_bid, best_ask = bids[0][0], asks[0][0]
     return {
         "bids": bids,
         "asks": asks,
         "bid_qty": bid_qty,
         "ask_qty": ask_qty,
         "imbalance": (bid_qty - ask_qty) / total_qty if total_qty else 0.0,
-        "mid": (best_bid + best_ask) / 2,
-        "spread": best_ask - best_bid,
+        "mid": (best_bid + best_ask) / 2 if bids and asks else 0.0,
+        "spread": best_ask - best_bid if bids and asks else 0.0,
     }
+
+
+def calculate_consecutive_losses(trades: list[dict[str, Any]]) -> int:
+    streak = 0
+    best_streak = 0
+    for trade in trades:
+        pnl = float(trade.get("Net PnL (USDT)", 0.0))
+        if pnl < 0:
+            streak += 1
+            best_streak = max(best_streak, streak)
+        else:
+            streak = 0
+    return best_streak
+
+
+def calculate_drawdown_pct(equity_curve: list[dict[str, Any]]) -> float:
+    if not equity_curve:
+        return 0.0
+    values = [float(item.get("eq", 0.0)) for item in equity_curve if "eq" in item]
+    if not values:
+        return 0.0
+    peak = values[0]
+    max_drawdown = 0.0
+    for value in values:
+        if value > peak:
+            peak = value
+        if peak <= 0:
+            continue
+        drawdown = (peak - value) / peak * 100.0
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+    return max_drawdown
 
 
 def find_jump_zones(
@@ -299,19 +501,18 @@ def close_position(mark: float, reason: str, fee_bps: float, slippage_bps: float
     )
     risk_budget = position.get("risk_budget", 0.0)
     r_multiple = net_pnl / risk_budget if risk_budget > 0 else 0.0
-    st.session_state.paper_trades.insert(
-        0,
-        {
-            "Closed (UTC)": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "Side": position["label"],
-            "Entry": position["entry"],
-            "Exit": exit_fill,
-            "Quantity (BTC)": position["quantity"],
-            "Net PnL (USDT)": net_pnl,
-            "R": r_multiple,
-            "Exit reason": reason,
-        },
-    )
+    trade_record = {
+        "Closed (UTC)": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "Side": position["label"],
+        "Entry": position["entry"],
+        "Exit": exit_fill,
+        "Quantity (BTC)": position["quantity"],
+        "Net PnL (USDT)": net_pnl,
+        "R": r_multiple,
+        "Exit reason": reason,
+    }
+    st.session_state.paper_trades.insert(0, trade_record)
+    save_trade_journal(st.session_state.paper_trades)
     st.session_state.paper_position = None
     if net_pnl < 0:
         st.session_state.cooldown_until = datetime.now(timezone.utc).timestamp() + 300.0
@@ -326,6 +527,7 @@ def open_position(
     max_leverage: float,
     fee_bps: float,
     slippage_bps: float,
+    reward_risk: float,
 ) -> str | None:
     if st.session_state.paper_position is not None:
         return "Close the open position before opening another."
@@ -364,6 +566,8 @@ with st.sidebar:
     fee_bps = st.number_input("Fee per side (bps)", min_value=0.0, max_value=50.0, value=5.0, step=0.5)
     slippage_bps = st.number_input("Slippage per side (bps)", min_value=0.0, max_value=50.0, value=1.0, step=0.5)
     daily_loss_percent = st.number_input("Daily loss limit (%)", min_value=0.5, max_value=20.0, value=2.0, step=0.5)
+    max_drawdown_percent = st.number_input("Max drawdown (%)", min_value=1.0, max_value=100.0, value=25.0, step=1.0)
+    max_consecutive_losses = st.number_input("Max consecutive losses", min_value=1, max_value=20, value=4, step=1)
     st.divider()
     st.subheader("Signal thresholds")
     min_flow = st.slider("Minimum 60s delta / volume", min_value=0.05, max_value=0.80, value=0.20, step=0.05)
@@ -377,6 +581,7 @@ with st.sidebar:
     require_validation_edge = st.checkbox("Require holdout above baseline", value=True)
     if st.button("Clear paper history", use_container_width=True):
         st.session_state.paper_trades = []
+        save_trade_journal(st.session_state.paper_trades)
         st.session_state.paper_position = None
         st.session_state.equity_history = []
         st.session_state.cooldown_until = None
@@ -403,6 +608,7 @@ def market_dashboard() -> None:
 
     trades = st.session_state.trade_buffer
     flow = summarize_flow(trades)
+    aggressor_strength = describe_aggressor_strength(flow, min_flow, int(min_trades), float(min_total_btc))
     book = summarize_book(raw_book, book_levels)
     mark = float(trades[-1]["price"]) if trades else float(book["mid"])
     perp_spot_basis_bps = (mark / spot_usd - 1) * 10_000 if spot_usd else 0.0
@@ -414,7 +620,8 @@ def market_dashboard() -> None:
         st.warning("Data stale: no successful update in >9 seconds. Paper buttons may be greyed until fresh data returns.")
     cooldown_active = st.session_state.cooldown_until is not None and now < st.session_state.cooldown_until
     completed_klines = tuple(tuple(row) for row in raw_klines if int(row[6]) < now_ms)
-    candle_forecast = cached_forecast(completed_klines) if completed_klines else None
+    last_close_ms = int(completed_klines[-1][6]) if completed_klines else 0
+    candle_forecast = cached_forecast(last_close_ms, completed_klines) if completed_klines else None
 
     position = st.session_state.paper_position
     if position is not None:
@@ -440,7 +647,11 @@ def market_dashboard() -> None:
     )
     daily_pnl = daily_realized + unrealized
     loss_limit = starting_equity * daily_loss_percent / 100
-    risk_locked = daily_pnl <= -loss_limit or cooldown_active
+    drawdown_pct = calculate_drawdown_pct(st.session_state.equity_history)
+    consecutive_losses = calculate_consecutive_losses(st.session_state.paper_trades)
+    max_drawdown_lock = drawdown_pct >= max_drawdown_percent
+    consecutive_loss_lock = consecutive_losses >= max_consecutive_losses
+    risk_locked = daily_pnl <= -loss_limit or cooldown_active or max_drawdown_lock or consecutive_loss_lock
 
     st.success("Connected · refreshing every 3 seconds")
     metrics = st.columns(4)
@@ -572,44 +783,62 @@ def market_dashboard() -> None:
         "A thin band may allow faster movement if pressure reaches it; it is not a price prediction, and orders can be canceled."
     )
 
-    st.subheader("Live BTCUSDT price · rolling 5-minute view")
-    chart_rows = [
-        {
-            "UTC time": datetime.fromtimestamp(trade["time"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "Price (USDT)": trade["price"],
-        }
-        for trade in trades
-        if trade["time"] >= now - 300
-    ]
-    if chart_rows:
-        price_chart = (
-            alt.Chart(alt.Data(values=chart_rows))
-            .mark_line(color="#177a55", strokeWidth=2)
-            .encode(
-                x=alt.X(
+    st.subheader("Live BTCUSDT price · short-term views")
+    chart_columns = st.columns(3)
+    for column, minutes in zip(chart_columns, (1, 3, 5)):
+        chart_rows = aggregate_trade_candles(trades, now, minutes * 60)
+        with column:
+            st.subheader(f"Rolling {minutes}-minute view")
+            if chart_rows:
+                candle_data = alt.Chart(alt.Data(values=chart_rows))
+                x_axis = alt.X(
                     "UTC time:T",
                     scale=alt.Scale(type="utc"),
-                    axis=alt.Axis(title="Time (UTC)", format="%H:%M:%S", labelAngle=0, tickCount=6),
-                ),
-                y=alt.Y(
-                    "Price (USDT):Q",
-                    scale=alt.Scale(zero=False, padding=8),
-                    axis=alt.Axis(title="Price (USDT)", format=",.2f"),
-                ),
-                tooltip=[
-                    alt.Tooltip("UTC time:T", format="%Y-%m-%d %H:%M:%S UTC"),
-                    alt.Tooltip("Price (USDT):Q", format=",.2f"),
-                ],
-            )
-            .properties(height=280)
-            .configure_view(stroke=None)
-            .configure_axis(gridColor="#d9e3dc", labelColor="#65756c", titleColor="#65756c")
-        )
-        st.altair_chart(price_chart, width="stretch")
+                    axis=alt.Axis(title="Time (UTC)", format="%H:%M:%S", labelAngle=0, tickCount=5),
+                )
+                direction_color = alt.Color(
+                    "Direction:N",
+                    scale=alt.Scale(domain=["Up", "Down"], range=["#177a55", "#c34444"]),
+                    legend=None,
+                )
+                candle_tooltip = [
+                    alt.Tooltip("UTC time:N", title="Bucket (UTC)"),
+                    alt.Tooltip("Open:Q", format=",.2f"),
+                    alt.Tooltip("High:Q", format=",.2f"),
+                    alt.Tooltip("Low:Q", format=",.2f"),
+                    alt.Tooltip("Close:Q", format=",.2f"),
+                    alt.Tooltip("Trades:Q"),
+                ]
+                wicks = candle_data.mark_rule().encode(
+                    x=x_axis,
+                    y=alt.Y("High:Q", scale=alt.Scale(zero=False, padding=8), title="Price (USDT)"),
+                    y2="Low:Q",
+                    color=direction_color,
+                    tooltip=candle_tooltip,
+                )
+                bodies = candle_data.mark_bar(size=8).encode(
+                    x=x_axis,
+                    y=alt.Y("Open:Q", scale=alt.Scale(zero=False, padding=8), title="Price (USDT)"),
+                    y2="Close:Q",
+                    color=direction_color,
+                    tooltip=candle_tooltip,
+                )
+                price_chart = (
+                    alt.layer(wicks, bodies)
+                    .properties(height=260)
+                    .configure_view(stroke=None)
+                    .configure_axis(gridColor="#d9e3dc", labelColor="#65756c", titleColor="#65756c")
+                )
+                st.altair_chart(
+                    price_chart,
+                    width="stretch",
+                    alt=f"BTCUSDT {minutes}-minute candlestick chart with 10-second OHLC bars",
+                )
+            else:
+                st.info(f"Waiting for recent Binance trades to populate the {minutes}-minute chart.")
+    if trades:
         latest_trade_time = datetime.fromtimestamp(trades[-1]["time"], timezone.utc).strftime("%H:%M:%S UTC")
-        st.caption(f"Latest Binance trade: {latest_trade_time} · chart refreshes every {REFRESH_SECONDS} seconds · times in UTC.")
-    else:
-        st.info("Waiting for recent Binance trades to populate the live price chart.")
+        st.caption(f"Latest Binance trade: {latest_trade_time} · charts refresh every {REFRESH_SECONDS} seconds · times in UTC.")
 
     left, right = st.columns([1.4, 1])
     with left:
@@ -619,13 +848,25 @@ def market_dashboard() -> None:
             f"Seller-initiated: **{flow['sell_qty']:.3f} BTC** · "
             f"Trades: **{flow['trade_count']}** · Total: **{flow['total']:.3f} BTC**"
         )
+        buyer_share = flow["buy_qty"] / flow["total"] if flow["total"] else 0.0
+        seller_share = flow["sell_qty"] / flow["total"] if flow["total"] else 0.0
+        aggressor_label = describe_aggressor_strength(flow, min_flow, int(min_trades), float(min_total_btc))
+        st.write(
+            f"**{aggressor_label}** · Buyer share {buyer_share:.1%} · Seller share {seller_share:.1%}"
+        )
+        flow_intervals = summarize_flow_intervals(trades, now)
+        if flow_intervals:
+            average_interval_delta = sum(row["Net delta (BTC)"] for row in flow_intervals) / len(flow_intervals)
+            st.metric("Average net delta per 10s · last minute", f"{average_interval_delta:+.3f} BTC")
+        st.dataframe(flow_intervals, hide_index=True, width="stretch", height=250)
         recent = [trade for trade in trades if trade["time"] >= now - TRADE_WINDOW_SECONDS]
         if recent and abs(float(flow["delta_fraction"])) >= min_flow:
-            first_price, last_price = recent[0]["price"], recent[-1]["price"]
-            move_bps = (last_price / first_price - 1) * 10_000 if first_price else 0.0
-            if abs(move_bps) < 3:
-                absorption = "possible passive-buy absorption" if flow["delta"] < 0 else "possible passive-sell absorption"
-                st.info(f"Possible absorption heuristic: {absorption}; price moved {move_bps:+.1f} bps despite strong one-sided aggression.")
+            alert = absorption_heuristic(recent, flow)
+            if alert and st.session_state.get("absorption_shown") is not True:
+                st.session_state["absorption_shown"] = True
+                st.info(alert["message"])
+            elif not alert:
+                st.session_state["absorption_shown"] = False
     if trades:
         latest_age = now - trades[-1]["time"]
         st.caption(f"Last trade: {latest_age:.1f}s ago")
@@ -649,10 +890,16 @@ def market_dashboard() -> None:
     st.divider()
     st.subheader("Paper trading")
     if risk_locked:
+        lock_reasons: list[str] = []
         if cooldown_active:
-            st.error(f"Cooldown active for ~{int(st.session_state.cooldown_until - now)}s after a losing trade.")
-        else:
-            st.error(f"Daily loss limit reached ({daily_pnl:,.2f} USDT). New positions are locked for this UTC day.")
+            lock_reasons.append(f"cooldown active for ~{int(st.session_state.cooldown_until - now)}s")
+        if daily_pnl <= -loss_limit:
+            lock_reasons.append(f"daily loss limit reached ({daily_pnl:,.2f} USDT)")
+        if max_drawdown_lock:
+            lock_reasons.append(f"drawdown hit {max_drawdown_percent:.1f}% threshold ({drawdown_pct:.1f}%)")
+        if consecutive_loss_lock:
+            lock_reasons.append(f"{max_consecutive_losses} consecutive losses reached ({consecutive_losses})")
+        st.error("New positions are locked: " + "; ".join(lock_reasons) + ".")
     account_cols = st.columns(4)
     account_cols[0].metric("Paper equity", f"{equity:,.2f} USDT")
     account_cols[1].metric("Today net PnL", f"{daily_pnl:+,.2f} USDT")
@@ -678,6 +925,7 @@ def market_dashboard() -> None:
                 max_leverage,
                 fee_bps,
                 slippage_bps,
+                reward_risk,
             )
             if error:
                 st.warning(error)
@@ -710,20 +958,7 @@ def market_dashboard() -> None:
         gross_loss = -sum(float(t["Net PnL (USDT)"]) for t in trades_list if float(t["Net PnL (USDT)"]) < 0)
         pf = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
         eq_curve = list(st.session_state.equity_history)
-        if eq_curve:
-            eqs = [e["eq"] for e in eq_curve]
-            peaks = []
-            dd = 0.0
-            peak = eqs[0]
-            for v in eqs:
-                if v > peak:
-                    peak = v
-                curdd = (peak - v) / peak * 100.0 if peak > 0 else 0.0
-                if curdd > dd:
-                    dd = curdd
-            max_dd = dd
-        else:
-            max_dd = 0.0
+        max_dd = calculate_drawdown_pct(eq_curve)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Trades", total)
         c2.metric("Win rate", f"{winrate:.1f}%")
