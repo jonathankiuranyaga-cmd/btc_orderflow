@@ -63,7 +63,6 @@ from config import (  # noqa: F401
     TRADE_RETENTION_SECONDS,
     TRADE_WINDOW_SECONDS,
     USDT_PRODUCT,
-    AUTO_RELOAD_SECONDS,
 )
 from market_data import (  # noqa: F401
     SESSION,
@@ -533,30 +532,6 @@ def market_dashboard() -> None:
     with refresh_col:
         if st.button("↻ Refresh now", use_container_width=True, help="Force an immediate market data fetch"):
             st.rerun()
-
-    # JavaScript fallback auto-refresh: guarantees data freshness even when the
-    # Streamlit fragment timer pauses (tab unfocused, websocket blip, etc.).
-    # Reloads the page every AUTO_RELOAD_SECONDS; session state is restored
-    # from SQLite on restart so open positions, trades, and tape survive.
-    st.components.v1.html(
-        f"""
-        <script>
-        (function() {{
-            var lastReload = sessionStorage.getItem('btc_orderflow_last_reload');
-            var now = Date.now();
-            var interval = {AUTO_RELOAD_SECONDS} * 1000;
-            if (!lastReload || now - parseInt(lastReload, 10) >= interval) {{
-                sessionStorage.setItem('btc_orderflow_last_reload', String(now));
-                window.parent.location.reload();
-            }}
-            setInterval(function() {{
-                window.parent.location.reload();
-            }}, interval);
-        }})();
-        </script>
-        """,
-        height=0,
-    )
 
     decision_slot = st.empty()
     liquidation_state = get_liquidation_feed_state()
@@ -2054,5 +2029,4 @@ def market_dashboard() -> None:
             st.dataframe(why_inputs["rows"], hide_index=True, width="stretch")
 
 
-with st.spinner("Fetching market data..."):
-    market_dashboard()
+market_dashboard()
