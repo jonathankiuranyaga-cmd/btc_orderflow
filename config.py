@@ -13,7 +13,7 @@ SYMBOL = "BTCUSDT"
 PRODUCT = "BTC-USD"
 USDT_PRODUCT = "USDT-USD"
 
-REFRESH_SECONDS = 3
+REFRESH_SECONDS = 2
 TRADE_WINDOW_SECONDS = 60
 TRADE_RETENTION_SECONDS = 900
 
@@ -51,3 +51,7 @@ HEATMAP_PATH = Path(__file__).with_name("heatmap.html")
 # Closed-trade journal is append-only; open position and equity peak use
 # key/value storage so they survive restarts without polluting the journal.
 SESSION_SNAPSHOT_INTERVAL_SECONDS = 20.0
+
+# Closed trades older than this many days are purged automatically on startup
+# so the SQLite journal does not grow without bound over weeks of use.
+TRADE_JOURNAL_RETENTION_DAYS = 90

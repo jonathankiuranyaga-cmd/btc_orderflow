@@ -1,0 +1,24 @@
+[theme]
+base = "light"
+primaryColor = "#1f6feb"
+backgroundColor = "#f7f9fc"
+secondaryBackgroundColor = "#eef2f8"
+textColor = "#16202e"
+font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#101a2b"
+secondaryBackgroundColor = "#16233a"
+textColor = "#e6edf7"
+primaryColor = "#4c9aff"
+
+[server]
+headless = true
+fileWatcherType = "auto"
+enableWebsocketCompression = true
+maxMessageSize = 200
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+serverPort = 8501

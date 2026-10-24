@@ -285,6 +285,7 @@ def initialize_state() -> None:
         "open_interest_change_pct": None,
         "alert_state": {"stale": False, "flow_side": None, "signal": None, "near_zone": False},
         "equity_history": [],
+        "last_refresh_ts": None,
         "equity_risk_history": load_session_value("equity_risk_history", []),
         "cooldown_until": None,
         "backtest_result": None,
@@ -516,6 +517,22 @@ st.session_state.starting_equity = starting_equity
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def market_dashboard() -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    st.session_state["last_refresh_ts"] = now
+
+    # Live refresh indicator + manual force-refresh
+    last = st.session_state.get("last_refresh_ts")
+    live_col, refresh_col = st.columns([6, 1])
+    with live_col:
+        if last is not None:
+            age = max(0, int(now - float(last)))
+            st.caption(f"🔴 Live · last refresh {age}s ago · auto every {REFRESH_SECONDS}s")
+        else:
+            st.caption(f"🔴 Live · auto every {REFRESH_SECONDS}s")
+    with refresh_col:
+        if st.button("↻ Refresh now", use_container_width=True, help="Force an immediate market data fetch"):
+            st.rerun()
+
     decision_slot = st.empty()
     liquidation_state = get_liquidation_feed_state()
     with liquidation_state["lock"]:
@@ -524,7 +541,6 @@ def market_dashboard() -> None:
         liquidation_reconnect_count = liquidation_state["reconnect_count"]
         last_liquidation_at = liquidation_state["last_event_at"]
     feed_results, feed_errors = fetch_market_data()
-    now = datetime.now(timezone.utc).timestamp()
     liquidation_health = {
         "connected": liquidation_connected,
         "reconnect_count": liquidation_reconnect_count,
