@@ -1,3 +1,15 @@
+"""Next-candle direction estimate for Binance BTCUSDT one-minute candles.
+
+A small regularized logistic model uses features from 1/3/5-minute returns,
+candle body, and relative volume to predict whether a future candle will close
+above the latest close. The label horizon is configurable: the default is the
+next one-minute candle, but the same machinery can forecast ten or more
+minutes ahead.
+
+Everything here is a pure function of the candle list, so it can be tested and
+run headlessly without a Streamlit runtime or a live feed.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -10,6 +22,9 @@ MIN_VALIDATION_SAMPLES = 50
 MIN_FEATURE_ROWS = 150
 FEATURE_COUNT = 5
 MAX_ROLLING_LABELS = 600
+# How many study points to emit at most, sampled across the test region so the
+# walk-forward graph stays quick to render.
+MAX_STUDY_POINTS = 200
 
 
 def _sigmoid(value: float) -> float:
@@ -17,6 +32,23 @@ def _sigmoid(value: float) -> float:
         return 1 / (1 + exp(-min(value, 40)))
     exp_value = exp(max(value, -40))
     return exp_value / (1 + exp_value)
+
+
+def _candles(rows: Sequence[Sequence[Any]], now_ms: int | None) -> list[dict[str, float]]:
+    if now_ms is None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    return [
+        {
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "time_ms": int(row[0]),
+        }
+        for row in rows
+        if len(row) >= 7 and int(row[6]) < now_ms
+    ]
 
 
 def _features(candles: list[dict[str, float]], index: int) -> list[float]:
@@ -80,36 +112,45 @@ def _predict(
     return _sigmoid(bias + sum(weight * value for weight, value in zip(weights, normalized)))
 
 
-def forecast_next_minute(
-    rows: Sequence[Sequence[Any]], now_ms: int | None = None
-) -> dict[str, float | int | str] | None:
-    if now_ms is None:
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    candles = [
-        {
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5]),
-        }
-        for row in rows
-        if len(row) >= 7 and int(row[6]) < now_ms
-    ]
-    if len(candles) < FEATURE_LOOKBACK + MIN_TRAIN_SAMPLES + MIN_VALIDATION_SAMPLES + 1:
-        return None
+def _label_rows(
+    candles: list[dict[str, float]], horizon_candles: int
+) -> tuple[list[list[float]], list[int], list[int]]:
+    """Build feature rows, labels, and the candle index each label refers to.
 
+    A label at feature row `index` is whether the candle `horizon_candles`
+    ahead closes above candle `index`.
+    """
     feature_rows: list[list[float]] = []
     labels: list[int] = []
-
-    for index in range(FEATURE_LOOKBACK, len(candles) - 1):
+    source_indices: list[int] = []
+    for index in range(FEATURE_LOOKBACK, len(candles) - horizon_candles):
         current_close = candles[index]["close"]
-        next_close = candles[index + 1]["close"]
-        if next_close == current_close:
+        future_close = candles[index + horizon_candles]["close"]
+        if future_close == current_close:
             continue
         feature_rows.append(_features(candles, index))
-        labels.append(int(next_close > current_close))
+        labels.append(int(future_close > current_close))
+        source_indices.append(index)
+    return feature_rows, labels, source_indices
 
+
+def forecast_candle(
+    rows: Sequence[Sequence[Any]],
+    horizon_candles: int = 1,
+    now_ms: int | None = None,
+) -> dict[str, float | int | str] | None:
+    """Predict whether the candle `horizon_candles` ahead closes up or down.
+
+    Returns None when there is not enough data. `horizon_candles=1` is the
+    original one-minute behaviour.
+    """
+    if horizon_candles < 1:
+        return None
+    candles = _candles(rows, now_ms)
+    if len(candles) < FEATURE_LOOKBACK + MIN_TRAIN_SAMPLES + MIN_VALIDATION_SAMPLES + horizon_candles + 1:
+        return None
+
+    feature_rows, labels, _source_indices = _label_rows(candles, horizon_candles)
     if len(feature_rows) == 0:
         return None
 
@@ -118,7 +159,6 @@ def forecast_next_minute(
         labels = labels[-MAX_ROLLING_LABELS:]
 
     split = int(len(feature_rows) * 0.8)
-
     if split < MIN_TRAIN_SAMPLES or len(feature_rows) - split < MIN_VALIDATION_SAMPLES or len(feature_rows) < MIN_FEATURE_ROWS:
         return None
 
@@ -154,4 +194,72 @@ def forecast_next_minute(
         "validation_samples": len(validation_labels),
         "latest_close": candles[-1]["close"],
         "below_baseline": validation_accuracy < baseline_accuracy - 1e-9,
+        "horizon_candles": horizon_candles,
     }
+
+
+def forecast_next_minute(
+    rows: Sequence[Sequence[Any]], now_ms: int | None = None
+) -> dict[str, float | int | str] | None:
+    """Predict whether the next one-minute candle closes up (original behaviour)."""
+    return forecast_candle(rows, horizon_candles=1, now_ms=now_ms)
+
+
+def forecast_study(
+    rows: Sequence[Sequence[Any]],
+    horizon_candles: int = 10,
+    train_fraction: float = 0.6,
+    max_points: int = MAX_STUDY_POINTS,
+    now_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Walk-forward study of predictions versus actual outcomes across all data.
+
+    For each sampled candle in the test region, trains on all earlier candles
+    (expanding window, capped at the latest MAX_ROLLING_LABELS labeled samples)
+    and predicts whether the candle `horizon_candles` ahead closes up. Returns
+    one record per sampled point with the predicted score, the actual outcome,
+    and whether the prediction was correct, suitable for graphing.
+    """
+    if horizon_candles < 1 or not (0.0 < train_fraction < 1.0):
+        return []
+    candles = _candles(rows, now_ms)
+    if len(candles) < FEATURE_LOOKBACK + MIN_TRAIN_SAMPLES + MIN_VALIDATION_SAMPLES + horizon_candles + 2:
+        return []
+
+    feature_rows, labels, source_indices = _label_rows(candles, horizon_candles)
+    if len(feature_rows) < MIN_FEATURE_ROWS:
+        return []
+
+    train_start_index = int(len(feature_rows) * train_fraction)
+    if train_start_index < MIN_TRAIN_SAMPLES:
+        train_start_index = MIN_TRAIN_SAMPLES
+    test_count = len(feature_rows) - train_start_index
+    if test_count < MIN_VALIDATION_SAMPLES:
+        return []
+
+    # Sample test points evenly so the graph stays quick to render.
+    step = max(1, test_count // max_points)
+    study_rows: list[dict[str, Any]] = []
+    for offset in range(train_start_index, len(feature_rows), step):
+        index = offset
+        train_rows = feature_rows[max(0, index - MAX_ROLLING_LABELS) : index]
+        train_labels = labels[max(0, index - MAX_ROLLING_LABELS) : index]
+        if len(train_rows) < MIN_TRAIN_SAMPLES:
+            continue
+        model = _fit_logistic(train_rows, train_labels)
+        up_score = _predict(feature_rows[index], model)
+        actual_up = bool(labels[index])
+        predicted_up = up_score >= 0.5
+        source_index = source_indices[index]
+        study_rows.append(
+            {
+                "time_ms": candles[source_index]["time_ms"],
+                "close": candles[source_index]["close"],
+                "up_score": up_score,
+                "actual_up": actual_up,
+                "predicted_up": predicted_up,
+                "correct": predicted_up == actual_up,
+                "horizon_candles": horizon_candles,
+            }
+        )
+    return study_rows

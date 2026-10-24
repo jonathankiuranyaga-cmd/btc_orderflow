@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from app import (
     absorption_heuristic,
     calculate_consecutive_losses,
+    calculate_conviction,
     calculate_drawdown_pct,
     calculate_unrealized,
     describe_aggressor_strength,
@@ -149,3 +150,89 @@ def test_absorption_heuristic_no_alert_when_price_moves():
     ]
     flow = {"delta": 1.0, "delta_fraction": 0.8}
     assert absorption_heuristic(recent, flow) is None
+
+
+def test_calculate_conviction_requires_actionable_setup():
+    flow = {"delta_fraction": 0.5, "trade_count": 30}
+    book = {"imbalance": 0.5}
+    result = calculate_conviction(
+        "FLAT",
+        flow,
+        book,
+        "UP_CLEAR",
+        0.8,
+        {"active": False, "confidence": 0.0},
+        min_flow=0.2,
+        min_book=0.15,
+        flow_ok=True,
+        stale_data=False,
+    )
+    assert result["score"] == 0
+    assert result["components"] == {}
+
+
+def test_calculate_conviction_strong_agreement_scores_high():
+    flow = {"delta_fraction": 0.6, "trade_count": 40}
+    book = {"imbalance": 0.5}
+    result = calculate_conviction(
+        "LONG",
+        flow,
+        book,
+        "UP_CLEAR",
+        0.85,
+        {"active": True, "confidence": 0.9},
+        min_flow=0.2,
+        min_book=0.15,
+        flow_ok=True,
+        stale_data=False,
+    )
+    assert result["score"] >= 75
+    assert result["components"]["Model agreement"] == 1.0
+
+
+def test_calculate_conviction_model_conflict_reduces_score():
+    flow = {"delta_fraction": 0.6, "trade_count": 40}
+    book = {"imbalance": 0.5}
+    agreeing = calculate_conviction(
+        "LONG",
+        flow,
+        book,
+        "UP_CLEAR",
+        0.85,
+        {"active": True, "confidence": 0.9},
+        min_flow=0.2,
+        min_book=0.15,
+        flow_ok=True,
+        stale_data=False,
+    )
+    conflicting = calculate_conviction(
+        "LONG",
+        flow,
+        book,
+        "DOWN_CLEAR",
+        0.85,
+        {"active": True, "confidence": 0.9},
+        min_flow=0.2,
+        min_book=0.15,
+        flow_ok=True,
+        stale_data=False,
+    )
+    assert conflicting["score"] < agreeing["score"]
+
+
+def test_calculate_conviction_stale_data_scores_zero():
+    flow = {"delta_fraction": 0.6, "trade_count": 40}
+    book = {"imbalance": 0.5}
+    result = calculate_conviction(
+        "LONG",
+        flow,
+        book,
+        "UP_CLEAR",
+        0.85,
+        {"active": True, "confidence": 0.9},
+        min_flow=0.2,
+        min_book=0.15,
+        flow_ok=True,
+        stale_data=True,
+    )
+    assert result["score"] == 0
