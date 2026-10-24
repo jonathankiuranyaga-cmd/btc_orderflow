@@ -63,7 +63,6 @@ from config import (  # noqa: F401
     TRADE_RETENTION_SECONDS,
     TRADE_WINDOW_SECONDS,
     USDT_PRODUCT,
-    AUTO_RELOAD_SECONDS,
 )
 from market_data import (  # noqa: F401
     SESSION,
@@ -560,41 +559,14 @@ def _render_market_dashboard() -> None:
         btn_help = "Resume auto-refresh (every 10s)" if paused else "Pause auto-refresh"
         if st.button(btn_label, use_container_width=True, help=btn_help):
             st.session_state.refresh_paused = not paused
-            st.components.v1.html(
-                f"""
-                <script>
-                sessionStorage.setItem('btc_orderflow_paused', {'1' if st.session_state.refresh_paused else '0'});
-                </script>
-                """,
-                height=0,
-            )
             st.rerun()
 
-    # JavaScript full-page auto-reload: respects pause state stored in
-    # sessionStorage. When paused, no reloads happen — the user must click
-    # Resume to start again. Guarantees data freshness even when the tab is
-    # unfocused (fragment timers pause when the tab is not active).
-    st.components.v1.html(
-        f"""
-        <script>
-        (function() {{
-            var interval = {AUTO_RELOAD_SECONDS} * 1000;
-            var paused = sessionStorage.getItem('btc_orderflow_paused') === '1';
-            if (!paused) {{
-                sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
-                setInterval(function() {{
-                    var stillPaused = sessionStorage.getItem('btc_orderflow_paused') === '1';
-                    if (!stillPaused) {{
-                        sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
-                        window.parent.location.reload();
-                    }}
-                }}, interval);
-            }}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
+    # JavaScript full-page auto-reload removed — values and graphs update in
+    # place via the Streamlit fragment above (@st.fragment run_every). The
+    # fragment re-runs every REFRESH_SECONDS seconds and only redraws this
+    # dashboard section, so the rest of the page never reloads.
+    # Pause/resume state lives in session state only; the fragment simply
+    # skips data fetching when paused.
 
     # When paused, skip all data fetching — only the UI controls above render.
     if paused:
