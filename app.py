@@ -558,18 +558,16 @@ def _render_market_dashboard() -> None:
     # browser tab is unfocused. Streamlit fragment timers pause when the tab is
     # not active, so this reloads the page every AUTO_RELOAD_SECONDS seconds.
     # Session state is restored from SQLite on reload (positions, trades, tape).
+    # The timestamp is set on first load; setInterval handles all reloads so the
+    # page never reloads before it has finished opening.
     st.components.v1.html(
         f"""
         <script>
         (function() {{
-            var lastReload = sessionStorage.getItem('btc_orderflow_last_reload');
-            var now = Date.now();
             var interval = {AUTO_RELOAD_SECONDS} * 1000;
-            if (!lastReload || now - parseInt(lastReload, 10) >= interval) {{
-                sessionStorage.setItem('btc_orderflow_last_reload', String(now));
-                window.parent.location.reload();
-            }}
+            sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
             setInterval(function() {{
+                sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
                 window.parent.location.reload();
             }}, interval);
         }})();
