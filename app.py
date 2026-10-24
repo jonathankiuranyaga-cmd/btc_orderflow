@@ -59,6 +59,7 @@ from config import (  # noqa: F401
     SESSION_SNAPSHOT_INTERVAL_SECONDS,
     STALE_AFTER_MS,
     SYMBOL,
+    TRADE_JOURNAL_RETENTION_DAYS,
     TRADE_RETENTION_SECONDS,
     TRADE_WINDOW_SECONDS,
     USDT_PRODUCT,
@@ -104,9 +105,15 @@ from journal import (  # noqa: F401
     append_trade_journal,
     clear_trade_journal,
     delete_session_value,
+    export_all_data,
     init_trade_journal,
+    list_backups,
+    list_exports,
     load_session_value,
     load_trade_journal,
+    purge_trades_older_than,
+    read_crash_journal,
+    restore_from_backup,
     save_session_value,
     save_trade_journal,
 )
@@ -139,8 +146,24 @@ def load_heatmap_html() -> str:
     _HEATMAP_CACHE["html"] = html
     return html
 
+FORECAST_CACHE_MAX_ENTRIES = 200
+
 _forecast_cache: dict[tuple[int, int], dict[str, Any] | None] = {}
 _forecast_cache_10m: dict[tuple[int, int], dict[str, Any] | None] = {}
+
+
+def _cache_put(cache: dict[tuple[int, int], dict[str, Any] | None], key: tuple[int, int], value: dict[str, Any] | None) -> None:
+    """Insert into a forecast cache, evicting the oldest entry when full.
+
+    The cache keys are (last_close_ms, len(rows)) so every new candle close
+    with a different row count creates a new entry. Without eviction this dict
+    grows for as long as the process runs, which is a memory leak on a
+    long-lived scalping desk.
+    """
+    if len(cache) >= FORECAST_CACHE_MAX_ENTRIES:
+        oldest = next(iter(cache))
+        del cache[oldest]
+    cache[key] = value
 
 
 def cached_forecast(
@@ -150,7 +173,7 @@ def cached_forecast(
     if key in _forecast_cache:
         return _forecast_cache[key]
     result = forecast_next_minute(list(rows)) if rows else None
-    _forecast_cache[key] = result
+    _cache_put(_forecast_cache, key, result)
     return result
 
 
@@ -161,7 +184,7 @@ def cached_forecast_10m(
     if key in _forecast_cache_10m:
         return _forecast_cache_10m[key]
     result = forecast_candle(list(rows), horizon_candles=10) if rows else None
-    _forecast_cache_10m[key] = result
+    _cache_put(_forecast_cache_10m, key, result)
     return result
 
 
@@ -367,6 +390,15 @@ def update_trade_buffer(rows: list[dict[str, Any]]) -> None:
 
 initialize_state()
 
+# Self-delete unused data: purge closed trades older than the retention window
+# so the SQLite journal does not grow without bound over weeks of use.
+try:
+    purged = purge_trades_older_than(TRADE_JOURNAL_RETENTION_DAYS)
+    if purged:
+        st.toast(f"Purged {purged} closed trade(s) older than {TRADE_JOURNAL_RETENTION_DAYS} days", icon=":material/delete_outline:")
+except sqlite3.Error:
+    pass
+
 with st.sidebar:
     st.markdown(
         """
@@ -445,6 +477,37 @@ with st.sidebar:
         st.session_state.cooldown_until = None
         st.toast("Paper history cleared", icon=":material/delete_outline:")
 
+    st.caption(
+        f"Journal: {len(st.session_state.paper_trades)} closed trade(s) · "
+        f"auto-purge older than {TRADE_JOURNAL_RETENTION_DAYS} days on startup · "
+        f"forecast cache capped at {FORECAST_CACHE_MAX_ENTRIES} entries"
+    )
+
+    st.divider()
+    st.subheader("🛡️ Data safety")
+    col_exp, col_restore = st.columns(2)
+    with col_exp:
+        if st.button("Export all data", use_container_width=True, help="Copies DB + crash journal to exports/ folder"):
+            export_dir = export_all_data()
+            st.session_state["last_export"] = str(export_dir)
+            st.toast(f"Exported to {export_dir.name}", icon=":material/save:")
+    with col_restore:
+        backups = list_backups()
+        if backups:
+            latest = backups[0]
+            if st.button("Restore latest backup", use_container_width=True, help=f"Restores {latest.name} (app restart required)"):
+                restore_from_backup(latest)
+                st.toast(f"Restored {latest.name} — restart the app", icon=":material/restore:")
+
+    exports = list_exports()
+    if exports:
+        st.caption(f"Exports: {len(exports)} folder(s) in exports/ · latest: {exports[0].name}")
+    if backups:
+        st.caption(f"Backups: {len(backups)} copy(ies) in backups/ · latest: {backups[0].name}")
+
+    crash_count = len(read_crash_journal())
+    st.caption(f"Crash journal: {crash_count} logged event(s) · replay with read_crash_journal()")
+
 if st.session_state.utc_day != datetime.now(timezone.utc).date().isoformat():
     st.session_state.utc_day = datetime.now(timezone.utc).date().isoformat()
 
@@ -475,7 +538,7 @@ def market_dashboard() -> None:
     usdt_usd = float(cached_data["usdt_usd"] or 0.0)
     open_interest_data = cached_data["binance_open_interest"] or {}
     funding_data = cached_data["binance_funding"] or {}
-    if "binance_trades" in feed_results:
+    if cached_data["binance_trades"] is not None:
         update_trade_buffer(raw_trades)
     try:
         raw_klines = fetch_one_minute_klines()
