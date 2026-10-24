@@ -14,6 +14,10 @@ PRODUCT = "BTC-USD"
 USDT_PRODUCT = "USDT-USD"
 
 REFRESH_SECONDS = 2
+# Fallback full-page auto-refresh interval (seconds). Guarantees data freshness
+# even when the Streamlit fragment timer pauses (tab unfocused, websocket drop).
+# Session state is restored from SQLite on reload.
+AUTO_RELOAD_SECONDS = 30
 TRADE_WINDOW_SECONDS = 60
 TRADE_RETENTION_SECONDS = 900
 
