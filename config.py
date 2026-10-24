@@ -14,6 +14,11 @@ PRODUCT = "BTC-USD"
 USDT_PRODUCT = "USDT-USD"
 
 REFRESH_SECONDS = 10
+# Full-page auto-reload interval (seconds). Guarantees data freshness even when
+# the browser tab is unfocused — Streamlit fragment timers pause when the tab
+# is not active, so this JavaScript fallback keeps the data current regardless.
+# Session state is restored from SQLite on reload (positions, trades, tape).
+AUTO_RELOAD_SECONDS = 10
 TRADE_WINDOW_SECONDS = 60
 TRADE_RETENTION_SECONDS = 900
 
