@@ -400,6 +400,15 @@ try:
 except sqlite3.Error:
     pass
 
+# Force an immediate data fetch on startup so the dashboard is never empty
+# on first load — populate the cache before the first render cycle.
+try:
+    startup_results, startup_errors = fetch_market_data()
+    record_feed_results(startup_results, startup_errors, datetime.now(timezone.utc).timestamp())
+    startup_klines = fetch_one_minute_klines()
+except Exception as _startup_err:  # noqa: BLE001
+    pass
+
 with st.sidebar:
     st.markdown(
         """
