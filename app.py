@@ -403,12 +403,15 @@ except sqlite3.Error:
 
 # Force an immediate data fetch on startup so the dashboard is never empty
 # on first load — populate the cache before the first render cycle.
+startup_fetch_error = None
 try:
     startup_results, startup_errors = fetch_market_data()
     record_feed_results(startup_results, startup_errors, datetime.now(timezone.utc).timestamp())
     startup_klines = fetch_one_minute_klines()
+    if startup_errors:
+        startup_fetch_error = "; ".join(f"{k}: {v}" for k, v in startup_errors.items())
 except Exception as _startup_err:  # noqa: BLE001
-    pass
+    startup_fetch_error = str(_startup_err)
 
 with st.sidebar:
     st.markdown(
@@ -424,6 +427,11 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+    st.markdown("---")
+    if startup_fetch_error:
+        st.error(f"Startup data fetch failed: {startup_fetch_error}")
+        if st.button("Retry data fetch", use_container_width=True):
+            st.rerun()
     st.markdown("---")
     session_trades = list(st.session_state.paper_trades)
     session_pnl = sum(float(trade["Net PnL (USDT)"]) for trade in session_trades)
@@ -621,7 +629,14 @@ def _render_market_dashboard() -> None:
             liquidation_health,
             {"total": int(st.session_state.missed_trades_total), "last": int(st.session_state.last_missed_trades)},
         )
-        st.info("Waiting for initial Binance trade and order-book snapshots. Paper entries remain disabled.")
+        st.warning(
+            "Waiting for initial Binance trade and order-book snapshots. "
+            "Paper entries remain disabled until data loads."
+        )
+        if st.button("Retry data fetch now", use_container_width=True, help="Immediately re-fetch Binance trades and book"):
+            retry_results, retry_errors = fetch_market_data()
+            record_feed_results(retry_results, retry_errors, datetime.now(timezone.utc).timestamp())
+            st.rerun()
         return
 
     flow = summarize_flow(trades, now)
