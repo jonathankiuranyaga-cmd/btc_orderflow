@@ -42,13 +42,23 @@ def request_json(url: str, params: dict[str, Any] | None = None) -> Any:
     return response.json()
 
 
-def fetch_market_data() -> tuple[dict[str, Any], dict[str, str]]:
-    """Poll every REST feed concurrently; return payloads and per-feed errors."""
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_coinbase_price_cached(product: str) -> float:
+    """Coinbase ticker price, cached for 30s — basis doesn't need 3s freshness."""
+    return float(request_json(f"{COINBASE_BASE}/products/{product}/ticker")["price"])
+
+
+def fetch_binance_feeds() -> tuple[dict[str, Any], dict[str, str]]:
+    """Poll Binance REST feeds concurrently (fast path, no Coinbase).
+
+    No cache: every refresh fetches fresh trades/book/OI/funding/klines.
+    Caching trade data conflicts with staleness detection, which expects a new
+    trade timestamp on every cycle — cached data freezes ``latest_trade_time``
+    and trips the "Binance trades stale" breaker.
+    """
     endpoints = [
         ("binance_trades", f"{BINANCE_BASE}/fapi/v1/aggTrades", {"symbol": SYMBOL, "limit": 1000}),
         ("binance_book", f"{BINANCE_BASE}/fapi/v1/depth", {"symbol": SYMBOL, "limit": 1000}),
-        ("coinbase_spot", f"{COINBASE_BASE}/products/{PRODUCT}/ticker", None),
-        ("usdt_usd", f"{COINBASE_BASE}/products/{USDT_PRODUCT}/ticker", None),
         ("binance_open_interest", f"{BINANCE_BASE}/fapi/v1/openInterest", {"symbol": SYMBOL}),
         ("binance_funding", f"{BINANCE_BASE}/fapi/v1/premiumIndex", {"symbol": SYMBOL}),
         ("binance_daily_klines", f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": SYMBOL, "interval": "1d", "limit": 2}),
@@ -62,10 +72,29 @@ def fetch_market_data() -> tuple[dict[str, Any], dict[str, str]]:
         for future in as_completed(futures):
             name = futures[future]
             try:
-                payload = future.result()
-                results[name] = float(payload["price"]) if name in ("coinbase_spot", "usdt_usd") else payload
+                results[name] = future.result()
             except (requests.RequestException, KeyError, TypeError, ValueError) as error:
                 errors[name] = str(error)
+    return results, errors
+
+
+def fetch_market_data() -> tuple[dict[str, Any], dict[str, str]]:
+    """Poll every REST feed; Binance fresh each call, Coinbase cached 30s.
+
+    Basis (Coinbase) changes slowly and does not need to block every 3s refresh,
+    so spot and USDT-USD are served from a short-lived cache while Binance
+    feeds (the signal inputs) are fetched fresh.
+    """
+    binance_results, binance_errors = fetch_binance_feeds()
+    errors = dict(binance_errors)
+    results: dict[str, Any] = dict(binance_results)
+
+    for product, key in ((PRODUCT, "coinbase_spot"), (USDT_PRODUCT, "usdt_usd")):
+        try:
+            results[key] = _fetch_coinbase_price_cached(product)
+        except (requests.RequestException, KeyError, TypeError, ValueError) as error:
+            results[key] = 0.0
+            errors[key] = str(error)
     return results, errors
 
 
@@ -213,6 +242,7 @@ __all__ = [
     "SESSION",
     "request_json",
     "fetch_market_data",
+    "fetch_binance_feeds",
     "fetch_one_minute_klines",
     "fetch_backtest_klines",
     "normalize_force_order",
