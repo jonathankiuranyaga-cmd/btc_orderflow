@@ -295,6 +295,7 @@ def initialize_state() -> None:
         "forecast_log": load_session_value("forecast_log", []),
         "forecast_study": [],
         "forecast_study_key": None,
+        "refresh_paused": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -541,40 +542,64 @@ def _render_market_dashboard() -> None:
     now = datetime.now(timezone.utc).timestamp()
     st.session_state["last_refresh_ts"] = now
 
-    # Live refresh indicator + manual force-refresh
+    # Live refresh indicator + manual force-refresh + pause/resume
     last = st.session_state.get("last_refresh_ts")
-    live_col, refresh_col = st.columns([6, 1])
+    paused = bool(st.session_state.get("refresh_paused", False))
+    live_col, refresh_col, pause_col = st.columns([5, 1.5, 1.5])
     with live_col:
-        if last is not None:
-            age = max(0, int(now - float(last)))
-            st.caption(f"🔴 Live · last refresh {age}s ago · auto every {REFRESH_SECONDS}s")
+        if paused:
+            st.caption(f"⏸ Paused · last refresh {(now - float(last)):.0f}s ago" if last is not None else "⏸ Paused")
         else:
-            st.caption(f"🔴 Live · auto every {REFRESH_SECONDS}s")
+            age = max(0, int(now - float(last))) if last is not None else 0
+            st.caption(f"🔴 Live · last refresh {age}s ago · auto every {REFRESH_SECONDS}s" if last is not None else f"🔴 Live · auto every {REFRESH_SECONDS}s")
     with refresh_col:
         if st.button("↻ Refresh now", use_container_width=True, help="Force an immediate market data fetch"):
             st.session_state["_force_refresh"] = now
+    with pause_col:
+        btn_label = "▶ Resume" if paused else "⏸ Pause"
+        btn_help = "Resume auto-refresh (every 10s)" if paused else "Pause auto-refresh"
+        if st.button(btn_label, use_container_width=True, help=btn_help):
+            st.session_state.refresh_paused = not paused
+            st.components.v1.html(
+                f"""
+                <script>
+                sessionStorage.setItem('btc_orderflow_paused', {'1' if st.session_state.refresh_paused else '0'});
+                </script>
+                """,
+                height=0,
+            )
+            st.rerun()
 
-    # JavaScript full-page auto-reload: guarantees data freshness even when the
-    # browser tab is unfocused. Streamlit fragment timers pause when the tab is
-    # not active, so this reloads the page every AUTO_RELOAD_SECONDS seconds.
-    # Session state is restored from SQLite on reload (positions, trades, tape).
-    # The timestamp is set on first load; setInterval handles all reloads so the
-    # page never reloads before it has finished opening.
+    # JavaScript full-page auto-reload: respects pause state stored in
+    # sessionStorage. When paused, no reloads happen — the user must click
+    # Resume to start again. Guarantees data freshness even when the tab is
+    # unfocused (fragment timers pause when the tab is not active).
     st.components.v1.html(
         f"""
         <script>
         (function() {{
             var interval = {AUTO_RELOAD_SECONDS} * 1000;
-            sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
-            setInterval(function() {{
+            var paused = sessionStorage.getItem('btc_orderflow_paused') === '1';
+            if (!paused) {{
                 sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
-                window.parent.location.reload();
-            }}, interval);
+                setInterval(function() {{
+                    var stillPaused = sessionStorage.getItem('btc_orderflow_paused') === '1';
+                    if (!stillPaused) {{
+                        sessionStorage.setItem('btc_orderflow_last_reload', String(Date.now()));
+                        window.parent.location.reload();
+                    }}
+                }}, interval);
+            }}
         }})();
         </script>
         """,
         height=0,
     )
+
+    # When paused, skip all data fetching — only the UI controls above render.
+    if paused:
+        st.caption("Auto-refresh is paused. Click ▶ Resume to continue.")
+        return
 
     decision_slot = st.empty()
     liquidation_state = get_liquidation_feed_state()
