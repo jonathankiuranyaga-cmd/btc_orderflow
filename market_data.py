@@ -58,8 +58,8 @@ def fetch_binance_feeds() -> tuple[dict[str, Any], dict[str, str]]:
     trade timestamp, not the fetch timestamp.
     """
     endpoints = [
-        ("binance_trades", f"{BINANCE_BASE}/fapi/v1/aggTrades", {"symbol": SYMBOL, "limit": 1000}),
-        ("binance_book", f"{BINANCE_BASE}/fapi/v1/depth", {"symbol": SYMBOL, "limit": 1000}),
+        ("binance_trades", f"{BINANCE_BASE}/fapi/v1/aggTrades", {"symbol": SYMBOL, "limit": 300}),
+        ("binance_book", f"{BINANCE_BASE}/fapi/v1/depth", {"symbol": SYMBOL, "limit": 50}),
         ("binance_open_interest", f"{BINANCE_BASE}/fapi/v1/openInterest", {"symbol": SYMBOL}),
         ("binance_funding", f"{BINANCE_BASE}/fapi/v1/premiumIndex", {"symbol": SYMBOL}),
         ("binance_daily_klines", f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": SYMBOL, "interval": "1d", "limit": 2}),
