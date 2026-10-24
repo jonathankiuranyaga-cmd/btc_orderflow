@@ -517,6 +517,17 @@ st.session_state.starting_equity = starting_equity
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def market_dashboard() -> None:
+    try:
+        _render_market_dashboard()
+    except Exception as error:  # noqa: BLE001
+        # Never let an exception kill the fragment auto-refresh timer. Show the
+        # error in the dashboard so the user can see what went wrong, and the
+        # fragment keeps re-running every REFRESH_SECONDS seconds.
+        st.error(f"Dashboard error: {error}")
+        st.exception(error)
+
+
+def _render_market_dashboard() -> None:
     now = datetime.now(timezone.utc).timestamp()
     st.session_state["last_refresh_ts"] = now
 
@@ -531,7 +542,7 @@ def market_dashboard() -> None:
             st.caption(f"🔴 Live · auto every {REFRESH_SECONDS}s")
     with refresh_col:
         if st.button("↻ Refresh now", use_container_width=True, help="Force an immediate market data fetch"):
-            st.rerun()
+            st.session_state["_force_refresh"] = now
 
     decision_slot = st.empty()
     liquidation_state = get_liquidation_feed_state()
