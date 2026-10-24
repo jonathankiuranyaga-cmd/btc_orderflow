@@ -48,13 +48,14 @@ def _fetch_coinbase_price_cached(product: str) -> float:
     return float(request_json(f"{COINBASE_BASE}/products/{product}/ticker")["price"])
 
 
+@st.cache_data(ttl=3, show_spinner=False)
 def fetch_binance_feeds() -> tuple[dict[str, Any], dict[str, str]]:
     """Poll Binance REST feeds concurrently (fast path, no Coinbase).
 
-    No cache: every refresh fetches fresh trades/book/OI/funding/klines.
-    Caching trade data conflicts with staleness detection, which expects a new
-    trade timestamp on every cycle — cached data freezes ``latest_trade_time``
-    and trips the "Binance trades stale" breaker.
+    Cached for 3s so rapid dashboard refreshes within the same window are
+    instant cache hits. Safe because update_trade_buffer always processes
+    whatever trades are in the cache — the staleness clock advances off the
+    trade timestamp, not the fetch timestamp.
     """
     endpoints = [
         ("binance_trades", f"{BINANCE_BASE}/fapi/v1/aggTrades", {"symbol": SYMBOL, "limit": 1000}),
